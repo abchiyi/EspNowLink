@@ -1,9 +1,0 @@
-menu "Radio Link"
-
-config RADIO_LINK_SLAVE_MODE
-    bool "Run Radio Link as slave"
-    help
-        启用选项以控制 Radio Link 作为从设备运行。
-        否则，它将作为主设备运行。
-
-endmenu
