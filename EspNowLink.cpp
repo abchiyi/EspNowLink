@@ -67,10 +67,12 @@ static std::atomic<bool> INIT_SUCCESS(false);             // 初始化成功标�
 static mac_t MAC_TARGET = {0};                            // 目标MAC地址
 static QueueHandle_t radioPackRecv = nullptr;             // 数据接收队列
 static QueueHandle_t radioPacketDelivery = nullptr;       // 数据分发队列
-static bool stored_device_loaded = false;                 // 标记是否已加载存储的设备
+static bool stored_device_loaded = false;                 // 历史设备加载标记
 static paired_device_info_t cached_device = {};           // 缓存的历史配对设备
-static std::atomic<bool> allow_new_pairing(true);         // 仅手动触发时才发现新设备
+static std::atomic<bool> allow_new_pairing(true);         // 发现新设备
 static QueueHandle_t handshake_queue = nullptr;           // 握手响应队列
+static TickType_t s_last_recv = 0;                        // 上次接收时间
+static const int TIMEOUT_NO_RECV_MS = 80;                 // 无接收超时时间
 
 static const mac_t broadcast_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static volatile bool s_send_in_flight = false; // 当前是否有在飞数据包
@@ -589,9 +591,7 @@ static void data_sent_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
     // 发送完成（成功或失败）后释放在飞标志
     s_send_in_flight = false;
     if (status != ESP_NOW_SEND_SUCCESS)
-    {
-        ESP_LOGW(TAG, "ESP-NOW send callback status=%d", (int)status);
-    }
+        ESP_LOGW(TAG, "ESP-NOW send callback - Send Fail");
 }
 
 void master_pairing_loop()
@@ -732,6 +732,7 @@ void espnow_link_task(void *pvParameters)
             // 仅处理业务数据（心跳机制已移除）
             if (xQueueReceive(radioPackRecv, &rp, portMAX_DELAY) == pdTRUE)
             {
+                s_last_recv = xTaskGetTickCount(); // 更新最后接收时间
                 xQueueOverwrite(radioPacketDelivery, &rp);
             }
         }
@@ -847,9 +848,24 @@ esp_err_t EspNowLink::start()
     return ESP_OK;
 }
 
+/**
+ * @brief 检查ESP-NOW链接的连接状态
+ * 
+ * @details 通过检查配对状态和接收超时来判断设备是否保持连接。
+ *          当设备已配对且在指定时间内收到过消息时，认为连接有效。
+ * 
+ * @return true  - 设备已配对且未超时，连接正常
+ * @return false - 设备未配对或超过接收超时时间，连接断开
+ * 
+ * @note 超时时间由宏 TIMEOUT_NO_RECV_MS 定义，单位为毫秒
+ * @note 使用原子操作读取配对状态以确保线程安全
+ * @note 基于FreeRTOS的系统时钟 xTaskGetTickCount() 计算超时
+ */
 bool EspNowLink::is_connected()
 {
-    return pairStatus.load() == ps_PAIRED;
+    TickType_t now = xTaskGetTickCount();
+    auto is_timeout = (now - s_last_recv) > pdMS_TO_TICKS(TIMEOUT_NO_RECV_MS);
+    return (pairStatus.load() == ps_PAIRED) && !is_timeout;
 }
 
 /**
