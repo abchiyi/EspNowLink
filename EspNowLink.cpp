@@ -21,18 +21,6 @@
 
 typedef uint8_t mac_t[ESP_NOW_ETH_ALEN]; // MAC地址类型
 
-// 握手包结构（在驱动层拦截，不传递给上层）
-typedef struct
-{
-    uint8_t magic;       // 握手魔数 0xAB（用于识别握手包）
-    mac_t peer_mac;      // 对方MAC地址
-    uint8_t channel;     // WiFi信道
-    uint8_t is_response; // 0=握手请求, 1=握手回复
-} __attribute__((packed)) handshake_packet_t;
-
-#define HANDSHAKE_MAGIC 0xAB // 握手包魔数
-#define HANDSHAKE_SIZE sizeof(handshake_packet_t)
-
 typedef struct
 {
     union
@@ -68,9 +56,8 @@ static mac_t MAC_TARGET = {0};                            // 目标MAC地址
 static QueueHandle_t radioPackRecv = nullptr;             // 数据接收队列
 static QueueHandle_t radioPacketDelivery = nullptr;       // 数据分发队列
 static bool stored_device_loaded = false;                 // 历史设备加载标记
-static paired_device_info_t cached_device = {};           // 缓存的历史配对设备
-static std::atomic<bool> allow_new_pairing(true);         // 发现新设备
-static QueueHandle_t handshake_queue = nullptr;           // 握手响应队列
+static paired_device_info_t cached_device = {};           // 历史配对设备
+static std::atomic<bool> allow_new_pairing(true);         // 发现新设备标志
 static TickType_t s_last_recv = 0;                        // 上次接收时间
 static const int TIMEOUT_NO_RECV_MS = 80;                 // 无接收超时时间
 
@@ -226,253 +213,6 @@ static esp_err_t clear_paired_device()
 }
 
 /**
- * @brief 发送握手请求包
- * @param peer_mac 对方MAC地址
- * @param channel WiFi信道
- * @return ESP_OK 发送成功, 其他值表示失败
- */
-static esp_err_t send_handshake_request(const uint8_t *peer_mac, uint8_t channel)
-{
-    handshake_packet_t hs_pkt = {};
-    hs_pkt.magic = HANDSHAKE_MAGIC;
-    hs_pkt.is_response = 0; // 握手请求
-    hs_pkt.channel = channel;
-    memcpy(hs_pkt.peer_mac, peer_mac, ESP_NOW_ETH_ALEN);
-
-    esp_err_t ret = esp_now_send(peer_mac, (uint8_t *)&hs_pkt, HANDSHAKE_SIZE);
-    if (ret == ESP_OK)
-    {
-        ESP_LOGD(TAG, "Handshake request sent to " MACSTR, MAC2STR(peer_mac));
-    }
-    else
-    {
-        ESP_LOGW(TAG, "Failed to send handshake request: %s", esp_err_to_name(ret));
-    }
-    return ret;
-}
-
-/**
- * @brief 发送握手回复包
- * @param peer_mac 对方MAC地址
- * @param channel WiFi信道
- * @return ESP_OK 发送成功, 其他值表示失败
- */
-static esp_err_t send_handshake_response(const uint8_t *peer_mac, uint8_t channel)
-{
-    handshake_packet_t hs_pkt = {};
-    hs_pkt.magic = HANDSHAKE_MAGIC;
-    hs_pkt.is_response = 1; // 握手回复
-    hs_pkt.channel = channel;
-    memcpy(hs_pkt.peer_mac, peer_mac, ESP_NOW_ETH_ALEN);
-
-    esp_err_t ret = esp_now_send(peer_mac, (uint8_t *)&hs_pkt, HANDSHAKE_SIZE);
-    if (ret == ESP_OK)
-    {
-        ESP_LOGD(TAG, "Handshake response sent to " MACSTR, MAC2STR(peer_mac));
-    }
-    else
-    {
-        ESP_LOGW(TAG, "Failed to send handshake response: %s", esp_err_to_name(ret));
-    }
-    return ret;
-}
-
-/**
- * @brief 验证握手请求包（辅助函数，减少代码重复）
- * @param hs_pkt 握手包指针
- * @return true 有效的握手请求, false 无效
- */
-static inline bool is_valid_handshake_request(const handshake_packet_t *hs_pkt)
-{
-    return hs_pkt != nullptr && hs_pkt->magic == HANDSHAKE_MAGIC && hs_pkt->is_response == 0;
-}
-
-/**
- * @brief 验证握手响应包（辅助函数，减少代码重复）
- * @param hs_pkt 握手包指针
- * @return true 有效的握手响应, false 无效
- */
-static inline bool is_valid_handshake_response(const handshake_packet_t *hs_pkt)
-{
-    return hs_pkt != nullptr && hs_pkt->magic == HANDSHAKE_MAGIC && hs_pkt->is_response == 1;
-}
-
-/**
- * @brief 等待指定对端的握手响应（仅首次配对使用）
- */
-static bool wait_handshake_response(const uint8_t *peer_mac, uint32_t timeout_ms)
-{
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    handshake_packet_t hs_pkt = {};
-
-    while (true)
-    {
-        TickType_t now = xTaskGetTickCount();
-        if (now >= deadline)
-            break;
-
-        TickType_t remain = deadline - now;
-        if (xQueueReceive(handshake_queue, &hs_pkt, remain) != pdTRUE)
-            break;
-
-        if (is_valid_handshake_response(&hs_pkt) &&
-            memcmp(hs_pkt.peer_mac, peer_mac, ESP_NOW_ETH_ALEN) == 0)
-        {
-            ESP_LOGD(TAG, "Handshake response received from " MACSTR, MAC2STR(hs_pkt.peer_mac));
-            return true;
-        }
-        // 若不是目标对端的响应，丢弃并继续等待
-    }
-
-    ESP_LOGW(TAG, "Handshake response timeout from " MACSTR, MAC2STR(peer_mac));
-    return false;
-}
-
-/**
- * @brief 从机等待指定对端的握手请求（仅首次配对使用）
- */
-static bool wait_handshake_request(const uint8_t *peer_mac, handshake_packet_t *hs_pkt)
-{
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(HANDSHAKE_TIMEOUT_MS);
-
-    while (true)
-    {
-        TickType_t now = xTaskGetTickCount();
-        if (now >= deadline)
-            break;
-
-        TickType_t remain = deadline - now;
-        if (xQueueReceive(handshake_queue, hs_pkt, remain) != pdTRUE)
-            break;
-
-        if (is_valid_handshake_request(hs_pkt) &&
-            memcmp(hs_pkt->peer_mac, peer_mac, ESP_NOW_ETH_ALEN) == 0)
-        {
-            return true;
-        }
-        // 若不是目标对端的请求，丢弃并继续等待
-    }
-
-    ESP_LOGW(TAG, "Handshake request timeout from " MACSTR, MAC2STR(peer_mac));
-    return false;
-}
-
-/**
- * @brief 执行完整握手流程（仅在驱动层）
- * @param peer_mac 对方MAC地址
- * @param channel WiFi信道
- * @return true 握手成功, false 握手失败
- * @note 仅首次配对时由主动方调用
- */
-static bool perform_handshake(const uint8_t *peer_mac, uint8_t channel)
-{
-    ESP_LOGI(TAG, "Starting handshake with " MACSTR " (initiator)", MAC2STR(peer_mac));
-
-    // 主动握手：发送请求并等待响应
-    for (int retry = 0; retry < 3; retry++)
-    {
-        ESP_LOGD(TAG, "Handshake attempt %d/3", retry + 1);
-
-        if (send_handshake_request(peer_mac, channel) != ESP_OK)
-        {
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        if (wait_handshake_response(peer_mac, 1000)) // 等待1秒响应
-        {
-            ESP_LOGI(TAG, "Handshake successful");
-            return true;
-        }
-    }
-    ESP_LOGW(TAG, "Handshake failed after 3 attempts");
-    return false;
-}
-
-/**
- * @brief Master 侧：基于广播得到的从机信息完成初次配对（含初始响应 + 握手）
- */
-static bool master_pair_new_slave(bcast_packet_t *bp, radio_packet_t *rp)
-{
-    uint8_t retry_count = 3;
-    while (retry_count > 0)
-    {
-        add_peer(bp->MAC_SLAVE, bp->channel);
-
-        esp_err_t result = esp_now_send(bp->MAC_SLAVE, rp->raw, sizeof(rp->raw));
-        if (result != ESP_OK)
-        {
-            retry_count--;
-            vTaskDelay(10 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        ESP_LOGD(TAG, "Initial response sent, performing handshake...");
-        if (!perform_handshake(bp->MAC_SLAVE, bp->channel))
-        {
-            ESP_LOGW(TAG, "Handshake failed with " MACSTR, MAC2STR(bp->MAC_SLAVE));
-            retry_count--;
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        pairStatus.store(ps_PAIRED);
-        memcpy(MAC_TARGET, bp->MAC_SLAVE, ESP_NOW_ETH_ALEN);
-        ESP_LOGI(TAG, "Connected to new Slave (handshake verified): " MACSTR,
-                 MAC2STR(bp->MAC_SLAVE));
-
-        save_paired_device(bp->MAC_SLAVE, bp->channel);
-        return true;
-    }
-
-    return false;
-}
-
-/**
- * @brief Slave 侧：基于广播得到的主机信息完成初次配对（含初始响应 + 握手回复）
- */
-static bool slave_pair_new_master(bcast_packet_t *bp, radio_packet_t *rp)
-{
-    esp_wifi_get_mac(WIFI_IF_STA, bp->MAC_SLAVE);
-    wifi_second_chan_t second;
-    esp_wifi_get_channel(&bp->channel, &second);
-
-    add_peer(bp->MAC_MASTER);
-    esp_err_t result = esp_now_send(bp->MAC_MASTER, rp->raw, sizeof(rp->raw));
-    if (result != ESP_OK)
-    {
-        ESP_LOGD(TAG, "Reply to Master failed: %s", esp_err_to_name(result));
-        return false;
-    }
-
-    ESP_LOGD(TAG, "Initial response sent, waiting for handshake request...");
-    handshake_packet_t hs_pkt = {};
-    if (!wait_handshake_request(bp->MAC_MASTER, &hs_pkt))
-    {
-        return false;
-    }
-
-    if (send_handshake_response(bp->MAC_MASTER, bp->channel) != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Failed to send handshake response to " MACSTR, MAC2STR(bp->MAC_MASTER));
-        return false;
-    }
-
-    pairStatus.store(ps_PAIRED);
-    memcpy(MAC_TARGET, bp->MAC_MASTER, ESP_NOW_ETH_ALEN);
-    cached_device = {0};
-    memcpy(cached_device.peer_mac, bp->MAC_MASTER, ESP_NOW_ETH_ALEN);
-    cached_device.channel = bp->channel;
-    cached_device.is_valid = true;
-    stored_device_loaded = true;
-    allow_new_pairing.store(false);
-    ESP_LOGI(TAG, "Paired with new Master (handshake verified): " MACSTR, MAC2STR(bp->MAC_MASTER));
-
-    save_paired_device(bp->MAC_MASTER, bp->channel);
-    return true;
-}
-
-/**
  *  选择WiFi 启动模式
  *   1. 未配置SSID和密码，启动AP模式
  *   2. 配置了SSID和密码，启动STA模式
@@ -548,21 +288,6 @@ static void data_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *da
     if (data == nullptr)
         return;
 
-    // ★ 新增：检查是否为握手包（驱动层拦截）
-    if (len == HANDSHAKE_SIZE && data[0] == HANDSHAKE_MAGIC)
-    {
-        // 这是握手包，在驱动层处理，不传给应用层
-        auto hs_pkt = (handshake_packet_t *)data;
-        ESP_LOGD(TAG, "Handshake packet received: is_response=%d", hs_pkt->is_response);
-
-        // 将握手包放入握手队列
-        if (handshake_queue != nullptr)
-        {
-            xQueueOverwrite(handshake_queue, (void *)data);
-        }
-        return; // ★ 不继续处理，直接返回
-    }
-
     // 已配对后仅接受来自目标对端的业务数据（丢弃其它来源/广播）
     if (pairStatus.load() == ps_PAIRED)
     {
@@ -630,20 +355,34 @@ void master_pairing_loop()
 
         if (xQueueReceive(radioPackRecv, &rp, 100 / portTICK_PERIOD_MS) == pdTRUE)
         {
-            // * STEP 2 收到响应，验证并完成配对
-            auto is_not_broadcast = rp.is_broadcast == 0;
+
+            // * STEP 2 收到从机响应，验证并告知从机接受配对
             auto macCheckOk = is_valid_mac(bp->MAC_SLAVE, sizeof(mac_t));
-            if (macCheckOk && is_not_broadcast)
+            if (!macCheckOk)
             {
-                if (master_pair_new_slave(bp, &rp))
-                    break; // 成功连接，跳出循环
+                ESP_LOGW(TAG, "Invalid Slave MAC in response");
+                continue;
             }
-            else
+
+            /**
+             *从机的响应数据包既是广播数据包，但不同的是广播包中的 MAC_SLAVE
+             *字段会被从机填充为自己的 MAC 地址，以便主机识别。主机只需要校验该
+             *MAC 地址是否合法即可将数据包返回从机以告知从机配对成功。
+             */
+            auto ret = esp_now_send(bp->MAC_SLAVE, rp.raw, sizeof(rp.raw));
+
+            if (ret != ESP_OK)
             {
-                ESP_LOGW(TAG, "Ignore packet, slave MAC %s, broadcast %s",
-                         macCheckOk ? "OK" : "ERR",
-                         is_not_broadcast ? "No" : "Yes");
+                ESP_LOGW(TAG, "Failed to send initial response to Slave: %s", esp_err_to_name(ret));
+                continue;
             }
+
+            /*
+             * 设置配对成功状态，储存目标MAC地址到NVS
+             */
+            pairStatus.store(ps_PAIRED);
+            memcpy(MAC_TARGET, bp->MAC_SLAVE, ESP_NOW_ETH_ALEN);
+            save_paired_device(bp->MAC_SLAVE, bp->channel);
         };
     }
 };
@@ -682,29 +421,71 @@ void slave_pairing_loop()
 
         // 进入新设备发现模式：监听广播包查找新的主机（仅在手动触发时）
         ESP_LOGI(TAG, "Listening for broadcast to discover new Master...");
+
         radio_packet_t rp = {};
+        auto bp = (bcast_packet_t *)rp.data;
 
         // 阻塞等待来自主机的广播
         if (xQueueReceive(radioPackRecv, &rp, portMAX_DELAY) != pdTRUE)
             continue;
+        /**
+         *从机的响应数据包既是广播数据包，但不同的是广播包中的 MAC_SLAVE
+         *字段会被从机填充为自己的 MAC 地址，以便主机识别。主机只需要校验该
+         *MAC 地址是否合法即可将数据包返回从机以告知从机配对成功。
+         */
 
-        auto bp = (bcast_packet_t *)rp.data;
-
-        bool is_broadcast = rp.is_broadcast != 0;
-        bool masterMacOk = is_valid_mac(bp->MAC_MASTER, sizeof(mac_t));
-
-        if (!(is_broadcast && masterMacOk))
+        if (!rp.is_broadcast)
         {
-            ESP_LOGD(TAG, "Ignore packet, master MAC %s, broadcast %s",
-                     masterMacOk ? "OK" : "ERR",
-                     is_broadcast ? "Yes" : "No");
+            ESP_LOGW(TAG, "Received non-broadcast packet during pairing, ignoring");
+        }
+
+        bool masterMacOk = is_valid_mac(bp->MAC_MASTER, sizeof(mac_t));
+        if (!masterMacOk)
+        {
+            ESP_LOGW(TAG, "Invalid Master MAC in broadcast");
             continue;
         }
 
-        if (slave_pair_new_master(bp, &rp))
-            return;
-    }
-};
+        // 缓存主机MAC地址
+        mac_t cache_mac_master = {0};
+        memcpy(&cache_mac_master, bp->MAC_MASTER, ESP_NOW_ETH_ALEN);
+
+        // * STEP 1 收到主机广播，回填自身MAC与channel后回复
+        if (!is_valid_mac(bp->MAC_MASTER, sizeof(mac_t)))
+        {
+            ESP_LOGW(TAG, "Invalid Master MAC in broadcast");
+            continue;
+        }
+
+        add_peer(cache_mac_master);
+        wifi_second_chan_t second;
+        esp_wifi_get_mac(WIFI_IF_STA, bp->MAC_SLAVE);
+        esp_wifi_get_channel(&bp->channel, &second);
+
+        // * STEP 2 回复并等待主机确认配对
+        auto result =
+            esp_now_send(cache_mac_master, rp.raw, sizeof(rp.raw));
+        if (result != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Reply to Master failed: %s", esp_err_to_name(result));
+            continue;
+        }
+
+        result = xQueueReceive(radioPackRecv, &rp, pdMS_TO_TICKS(100));
+        if (result != pdTRUE && !rp.is_broadcast)
+        {
+            ESP_LOGW(TAG, "No confirmation from Master, retrying...");
+            continue;
+        }
+
+        if (memcmp(bp->MAC_MASTER, cache_mac_master, ESP_NOW_ETH_ALEN) != 0)
+        {
+            pairStatus.store(ps_PAIRED);
+            memcpy(MAC_TARGET, bp->MAC_MASTER, ESP_NOW_ETH_ALEN);
+            save_paired_device(cache_mac_master, bp->channel);
+        }
+    };
+}
 
 /**
  *  处理设备配对和收包
@@ -797,10 +578,6 @@ esp_err_t EspNowLink::start()
     radioPacketDelivery = xQueueCreate(1, sizeof(radio_packet_t));
     configASSERT(radioPacketDelivery != nullptr);
 
-    // 创建握手队列（驱动层拦截的握手包队列）
-    handshake_queue = xQueueCreate(1, HANDSHAKE_SIZE);
-    configASSERT(handshake_queue != nullptr);
-
     // 创建任务
     xTaskCreate(espnow_link_task, "espnow_link_task", 1024 * 10, NULL, TP_H, NULL);
 
@@ -850,16 +627,11 @@ esp_err_t EspNowLink::start()
 
 /**
  * @brief 检查ESP-NOW链接的连接状态
- * 
+ *
  * @details 通过检查配对状态和接收超时来判断设备是否保持连接。
  *          当设备已配对且在指定时间内收到过消息时，认为连接有效。
- * 
  * @return true  - 设备已配对且未超时，连接正常
  * @return false - 设备未配对或超过接收超时时间，连接断开
- * 
- * @note 超时时间由宏 TIMEOUT_NO_RECV_MS 定义，单位为毫秒
- * @note 使用原子操作读取配对状态以确保线程安全
- * @note 基于FreeRTOS的系统时钟 xTaskGetTickCount() 计算超时
  */
 bool EspNowLink::is_connected()
 {
@@ -869,9 +641,9 @@ bool EspNowLink::is_connected()
 }
 
 /**
- * @brief 强制进入新设备配对模式，停止握手历史设备，转而发现新设备
+ * @brief 强制进入新设备配对模式
  *
- * 调用此接口后，会立即停止与历史设备的握手尝试，清除已保存的配对信息，
+ * 调用此接口后，清除已保存的配对信息，
  * 并进入新设备发现模式。配对循环会回到广播/监听模式寻找新的设备。
  *
  * @return esp_err_t 操作结果
