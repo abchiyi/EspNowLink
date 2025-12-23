@@ -369,6 +369,7 @@ void master_pairing_loop()
              *字段会被从机填充为自己的 MAC 地址，以便主机识别。主机只需要校验该
              *MAC 地址是否合法即可将数据包返回从机以告知从机配对成功。
              */
+            add_peer(bp->MAC_SLAVE);
             auto ret = esp_now_send(bp->MAC_SLAVE, rp.raw, sizeof(rp.raw));
 
             if (ret != ESP_OK)
@@ -437,6 +438,7 @@ void slave_pairing_loop()
         if (!rp.is_broadcast)
         {
             ESP_LOGW(TAG, "Received non-broadcast packet during pairing, ignoring");
+            continue;
         }
 
         bool masterMacOk = is_valid_mac(bp->MAC_MASTER, sizeof(mac_t));
