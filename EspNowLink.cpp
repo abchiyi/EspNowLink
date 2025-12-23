@@ -527,7 +527,6 @@ public:
     bool is_connected() override;
     esp_err_t start() override;
     esp_err_t rest() override;
-    esp_err_t pair_new_device() override;
 };
 
 // ESP-NOW 接收回调函数
@@ -853,11 +852,6 @@ bool EspNowLink::is_connected()
     return pairStatus.load() == ps_PAIRED;
 }
 
-esp_err_t EspNowLink::rest()
-{
-    return ESP_OK;
-};
-
 /**
  * @brief 强制进入新设备配对模式，停止握手历史设备，转而发现新设备
  *
@@ -866,75 +860,28 @@ esp_err_t EspNowLink::rest()
  *
  * @return esp_err_t 操作结果
  */
-esp_err_t EspNowLink::pair_new_device()
+esp_err_t EspNowLink::rest()
 {
-    // 关键步骤：设置标志，使握手循环退出
+    // 重置通信链路：清除已保存配对、允许新设备发现并回到未配对状态
     stored_device_loaded = false;
     allow_new_pairing.store(true);
     cached_device = {};
 
-    // 清除已保存的配对信息
     esp_err_t ret = clear_paired_device();
     if (ret != ESP_OK && ret != ESP_ERR_NVS_NOT_FOUND)
     {
         ESP_LOGW(TAG, "Failed to clear paired device: %s", esp_err_to_name(ret));
-        return ret;
+        // 即便清除失败，也继续执行重置到未配对状态
     }
 
-    // 重置配对状态和相关变量
     pairStatus.store(ps_UNPAIRED);
     memset(MAC_TARGET, 0, ESP_NOW_ETH_ALEN);
 
-    ESP_LOGI(TAG, "Pair new device mode activated, stopping handshake attempts and searching for new device...");
+    ESP_LOGI(TAG, "Link reset: cleared saved device and enabled new pairing discovery");
     return ESP_OK;
 };
 
 RadioLink *createEspNowLink()
 {
     return (RadioLink *)new EspNowLink();
-}
-
-/**
- * @brief 公开接口：清除已配对设备信息，强制进入配对模式
- * @return esp_err_t 操作结果
- */
-esp_err_t espnow_clear_paired_device()
-{
-    return clear_paired_device();
-}
-
-/**
- * @brief 获取配对状态（是否完成配对握手）
- *
- * 配对状态表示设备是否已经完成了与对方的配对握手流程。
- * 一旦配对成功，该状态将保持不变，直到调用 wifi_clear_paired_device() 或 radio_pair_new_device()。
- *
- * @return true  - 已完成配对（pairStatus = ps_PAIRED）
- *         false - 未配对或配对中（pairStatus = ps_UNPAIRED）
- *
- * @note 配对状态 != 连接状态
- *       - 配对状态：是否完成握手（一次性）
- *       - 连接状态：是否有活跃数据传输（动态检测）
- *       可能出现配对=true但连接=false的情况（如对方掉电或超出范围）
- */
-bool espnow_is_paired()
-{
-    return pairStatus.load() == ps_PAIRED;
-}
-
-/**
- * @brief 获取连接状态（是否有活跃的数据交互）
- *
- * 连接状态表示链路是否真正可用，需要满足两个条件：
- * 1. 已完成配对（pairStatus == ps_PAIRED）
- * 2. 最近收到了数据或心跳（未超过 HEARTBEAT_TIMEOUT_MS）
- *
- * @return true  - 连接活跃，可以发送数据
- *         false - 连接不可用或已断开
- *
- * @see espnow_is_paired() - 获取配对状态
- */
-bool espnow_is_connected()
-{
-    return pairStatus.load() == ps_PAIRED;
 }
