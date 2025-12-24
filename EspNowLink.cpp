@@ -315,8 +315,8 @@ static void data_sent_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
     // 发送完成（成功或失败）后释放在飞标志
     s_send_in_flight = false;
-    if (status != ESP_NOW_SEND_SUCCESS)
-        ESP_LOGW(TAG, "ESP-NOW send callback - Send Fail");
+    // if (status != ESP_NOW_SEND_SUCCESS)
+    //     ESP_LOGW(TAG, "ESP-NOW send callback - Send Fail");
 }
 
 void master_pairing_loop()
@@ -474,17 +474,23 @@ void slave_pairing_loop()
         }
 
         result = xQueueReceive(radioPackRecv, &rp, pdMS_TO_TICKS(100));
-        if (result != pdTRUE && !rp.is_broadcast)
+        if (result != pdTRUE)
         {
             ESP_LOGW(TAG, "No confirmation from Master, retrying...");
             continue;
         }
 
-        if (memcmp(bp->MAC_MASTER, cache_mac_master, ESP_NOW_ETH_ALEN) != 0)
+        if (memcmp(bp->MAC_MASTER, cache_mac_master, ESP_NOW_ETH_ALEN) == 0)
         {
             pairStatus.store(ps_PAIRED);
             memcpy(MAC_TARGET, bp->MAC_MASTER, ESP_NOW_ETH_ALEN);
             save_paired_device(cache_mac_master, bp->channel);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Master MAC mismatch in confirmation MACSTR: " MACSTR ", bp -" MACSTR,
+                     MAC2STR(cache_mac_master), MAC2STR(bp->MAC_MASTER));
+            continue;
         }
     };
 }
