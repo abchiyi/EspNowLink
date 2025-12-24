@@ -282,7 +282,7 @@ static void data_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *da
     int rssi = rx_ctrl->rssi;
 
     // 判断是否为广播包
-    bool broadcast = (dst_mac[0] & 0x01) != 0; // 广播地址第一个字节最低位为1
+    bool broadcast = memcmp(dst_mac, broadcast_addr, ESP_NOW_ETH_ALEN) == 0;
 
     lastRSSI.store(rssi);
     if (data == nullptr)
