@@ -5,6 +5,7 @@
 
 RadioLink *createEspNowLink();
 
-void espnow_wifi_init();
+void espnow_wifi_init_sta(bool LR_mode = false);
+void espnow_wifi_init_apsta(bool LR_mode = false);
 
 #endif

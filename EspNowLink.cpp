@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 
 #define TAG "espnow_link"
 #define NVS_NAMESPACE "espnow_link" // NVS命名空间
@@ -65,6 +66,9 @@ static const mac_t broadcast_addr = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static volatile bool s_send_in_flight = false; // 当前是否有在飞数据包
 static TickType_t s_last_no_mem_log = 0;       // 上次 NO_MEM 日志时间
 
+// 统一的 WiFi 启动状态标志，避免重复初始化
+static bool wifi_is_started = false;
+
 /*
  * 添加对等对象,使用无加密，STA接口，指定信道
  */
@@ -72,8 +76,13 @@ void add_peer(const uint8_t *peer_mac, uint8_t channel)
 {
     if (esp_now_is_peer_exist(peer_mac))
     {
-        ESP_LOGW(TAG, "Peer already exists: " MACSTR, MAC2STR(peer_mac));
-        return;
+        ESP_LOGW(TAG, "Peer already exists: " MACSTR ", deleting and re-adding", MAC2STR(peer_mac));
+        esp_err_t del_ret = esp_now_del_peer(peer_mac);
+        if (del_ret != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to delete existing peer: %s", esp_err_to_name(del_ret));
+            return;
+        }
     }
 
     esp_now_peer_info_t peer_info = {};
@@ -212,16 +221,8 @@ static esp_err_t clear_paired_device()
     return ESP_OK;
 }
 
-/**
- *  选择WiFi 启动模式
- *   1. 未配置SSID和密码，启动AP模式
- *   2. 配置了SSID和密码，启动STA模式
- *   3. STA模式下连接失败，启动AP模式
- */
-void espnow_wifi_init()
+void espnow_wifi_init_sta(bool LR_mode)
 {
-
-    static bool wifi_is_started = false;
     if (wifi_is_started)
         return;
 
@@ -238,26 +239,114 @@ void espnow_wifi_init()
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     esp_netif_create_default_wifi_sta();
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    if (LR_mode)
+    {
+#ifdef WIFI_PROTOCOL_LR
+        esp_err_t pr = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
+        if (pr != ESP_OK)
+            ESP_LOGW(TAG, "Set LR protocol failed: %s", esp_err_to_name(pr));
+        esp_err_t rate_ret = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_250K);
+        if (rate_ret != ESP_OK)
+            ESP_LOGW(TAG, "Set LR rate failed: %s", esp_err_to_name(rate_ret));
+        else
+            ESP_LOGI(TAG, "ESP-NOW LR rate set OK");
+#else
+        ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+        ESP_LOGI(TAG, "LR protocol not supported in this SDK version");
+#endif
+    }
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // 设定协议为 LR（若支持）
+    int8_t cur;
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
+    ESP_ERROR_CHECK(esp_wifi_get_max_tx_power(&cur));
+    ESP_LOGI(TAG, "Current max TX power: %d dBm", cur);
+
+    wifi_is_started = true;
+}
+
+void espnow_wifi_init_apsta(bool LR_mode)
+{
+    if (wifi_is_started)
+        return;
+
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+    // 开放式 AP，便于调试/发现设备
+    {
+        wifi_config_t ap_config = {};
+        uint8_t ap_mac[ESP_NOW_ETH_ALEN] = {};
+        char ssid[32] = {};
+        if (esp_wifi_get_mac(WIFI_IF_AP, ap_mac) == ESP_OK)
+        {
+            snprintf(ssid, sizeof(ssid), "RC Mini_%02X%02X%02X", ap_mac[3], ap_mac[4], ap_mac[5]);
+        }
+        else
+        {
+            strncpy(ssid, "RC Mini_- - -", sizeof(ssid) - 1);
+        }
+
+        strncpy((char *)ap_config.ap.ssid, ssid, sizeof(ap_config.ap.ssid) - 1);
+        ap_config.ap.ssid_len = (uint8_t)strlen(ssid);
+        ap_config.ap.channel = 1;
+        ap_config.ap.max_connection = 4;
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+        ap_config.ap.beacon_interval = 100;
+
+        esp_err_t ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+        if (ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Open AP configured: SSID=%s, channel=%d", ssid, ap_config.ap.channel);
+        }
+    }
+
+    if (LR_mode)
+    {
 #ifdef WIFI_PROTOCOL_LR
-    esp_err_t pr = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
-    if (pr != ESP_OK)
-        ESP_LOGW(TAG, "Set LR protocol failed: %s", esp_err_to_name(pr));
+        esp_err_t pr = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
+        if (pr != ESP_OK)
+            ESP_LOGW(TAG, "Set LR protocol failed: %s", esp_err_to_name(pr));
+        esp_err_t rate_ret = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_250K);
+        if (rate_ret != ESP_OK)
+            ESP_LOGW(TAG, "Set LR rate failed: %s", esp_err_to_name(rate_ret));
+        else
+            ESP_LOGI(TAG, "ESP-NOW LR rate set OK");
+#else
+        ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+        ESP_LOGI(TAG, "LR protocol not supported in this SDK version");
 #endif
+    }
 
-    // 设置 ESPNOW 速率为 LR 250K（若支持）
-    esp_err_t rate_ret =
-        esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_LORA_250K);
-    if (rate_ret != ESP_OK)
-        ESP_LOGW(TAG, "Set LR rate failed: %s", esp_err_to_name(rate_ret));
-    else
-        ESP_LOGI(TAG, "ESP-NOW LR rate set OK");
+    ESP_ERROR_CHECK(esp_wifi_start());
 
-    // 设置最大发射功率
-    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84)); // 约等于 20dBm
+    int8_t cur;
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
+    ESP_ERROR_CHECK(esp_wifi_get_max_tx_power(&cur));
+    ESP_LOGI(TAG, "Current max TX power: %d dBm", cur);
+
     wifi_is_started = true;
 }
 
@@ -441,13 +530,6 @@ void slave_pairing_loop()
             continue;
         }
 
-        bool masterMacOk = is_valid_mac(bp->MAC_MASTER, sizeof(mac_t));
-        if (!masterMacOk)
-        {
-            ESP_LOGW(TAG, "Invalid Master MAC in broadcast");
-            continue;
-        }
-
         // 缓存主机MAC地址
         mac_t cache_mac_master = {0};
         memcpy(&cache_mac_master, bp->MAC_MASTER, ESP_NOW_ETH_ALEN);
@@ -456,6 +538,7 @@ void slave_pairing_loop()
         if (!is_valid_mac(bp->MAC_MASTER, sizeof(mac_t)))
         {
             ESP_LOGW(TAG, "Invalid Master MAC in broadcast");
+            ESP_LOGW(TAG, "Master MACSTR: " MACSTR, MAC2STR(bp->MAC_MASTER));
             continue;
         }
 
@@ -553,7 +636,7 @@ esp_err_t EspNowLink::send(radio_packet_t *rp)
     /* *根据实际载荷大小发送数据 */
     esp_err_t ret = esp_now_send(MAC_TARGET,
                                  rp->raw,
-                                 rp->len + RADIO_PACKET_BASIC_SIZE);
+                                 sizeof(*rp));
     if (ret != ESP_OK)
     {
         // 发送未入队，释放在飞标志
@@ -590,7 +673,7 @@ esp_err_t EspNowLink::start()
     xTaskCreate(espnow_link_task, "espnow_link_task", 1024 * 10, NULL, TP_H, NULL);
 
     /*** WiFi ***/
-    espnow_wifi_init(); // 初始化WiFi
+    espnow_wifi_init_sta(); // 初始化WiFi（STA）
     // 关闭省电，降低发送排队延迟
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
